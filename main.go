@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	v1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
@@ -19,6 +21,7 @@ func main() {
 	var (
 		client           *kubernetes.Clientset
 		deploymentLabels map[string]string
+		expectedPods     int32
 		err              error
 	)
 	ctx := context.Background()
@@ -26,7 +29,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error: %s", err)
 		os.Exit(1)
 	}
-	if deploymentLabels, err = deploy(ctx, client); err != nil {
+	if deploymentLabels, expectedPods, err = deploy(ctx, client); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %s", err)
+		os.Exit(1)
+	}
+	if err = waitForPods(ctx, client, deploymentLabels, expectedPods); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s", err)
 		os.Exit(1)
 	}
@@ -48,40 +55,75 @@ func getClient() (*kubernetes.Clientset, error) {
 	return clientset, nil
 }
 
-func deploy(ctx context.Context, client *kubernetes.Clientset) (map[string]string, error) {
+func deploy(ctx context.Context, client *kubernetes.Clientset) (map[string]string, int32, error) {
 	var deployment *v1.Deployment
 
 	appFile, err := os.ReadFile("app.yaml")
 	if err != nil {
-		return nil, fmt.Errorf("readfile error: %s", err)
+		return nil, 0, fmt.Errorf("readfile error: %s", err)
 	}
 
 	obj, groupVersionKind, err := scheme.Codecs.UniversalDeserializer().Decode(appFile, nil, nil)
 	if err != nil {
-		return nil, fmt.Errorf("Decode error: %s", err)
+		return nil, 0, fmt.Errorf("Decode error: %s", err)
 	}
 
 	//checking whether it's a deployment k8s object
+	//or any other object
 	switch obj.(type) {
 	case *v1.Deployment:
 		deployment = obj.(*v1.Deployment)
 	default:
-		return nil, fmt.Errorf("unrecognized type: %s", groupVersionKind)
+		return nil, 0, fmt.Errorf("unrecognized type: %s", groupVersionKind)
 	}
 
 	_, err = client.AppsV1().Deployments("default").Get(ctx, deployment.Name, metav1.GetOptions{})
 	if err != nil && errors.IsNotFound(err) {
 		deploymentResponse, err := client.AppsV1().Deployments("default").Create(ctx, deployment, metav1.CreateOptions{})
 		if err != nil {
-			return nil, fmt.Errorf("deployment error: %s", err)
+			return nil, 0, fmt.Errorf("deployment error: %s", err)
 		}
-		return deploymentResponse.Spec.Template.Labels, nil
+		return deploymentResponse.Spec.Template.Labels, *deploymentResponse.Spec.Replicas, nil
 	} else if err != nil && !errors.IsNotFound(err) {
-		return nil, fmt.Errorf("deployment name issue: %s", err)
+		return nil, 0, fmt.Errorf("deployment name issue: %s", err)
 	}
 	deploymentResponse, err := client.AppsV1().Deployments("default").Update(ctx, deployment, metav1.UpdateOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("deployment error: %s", err)
+		return nil, 0, fmt.Errorf("deployment error: %s", err)
 	}
-	return deploymentResponse.Spec.Template.Labels, nil
+
+	return deploymentResponse.Spec.Template.Labels, *deploymentResponse.Spec.Replicas, nil
+}
+
+func waitForPods(ctx context.Context, client *kubernetes.Clientset, deployLabels map[string]string, expectedPods int32) error {
+	for {
+		valid, err := labels.ValidatedSelectorFromSet(deployLabels)
+		if err != nil {
+			return fmt.Errorf("validatedselectorfromset error: %s", err)
+		}
+		podList, err := client.CoreV1().Pods("default").List(ctx, metav1.ListOptions{
+			LabelSelector: valid.String(),
+		})
+		if err != nil {
+			return fmt.Errorf("pod list error: %s", err)
+		}
+		podsRunning := 0
+		for _, pod := range podList.Items {
+			if pod.Status.Phase == "Running" {
+				podsRunning++
+			}
+		}
+		if podsRunning == 0 {
+			continue
+		} else {
+			fmt.Printf("Waiting for pods to become ready (running %d / %d)\n", podsRunning, len(podList.Items))
+		}
+
+		if podsRunning > 0 && podsRunning == len(podList.Items) && podsRunning == int(expectedPods) {
+			break
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+	return nil
 }
